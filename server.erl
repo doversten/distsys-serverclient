@@ -10,6 +10,7 @@
 
 -export([start/0]).
 
+
 %%%%%%%%%%%%%%%%%%%%%%% STARTING SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start() -> 
     register(transaction_server, spawn(fun() ->
@@ -44,20 +45,12 @@ server_loop(ClientList,StorePid) ->
 	{request, Client} -> 
 	    Client ! {proceed, self()},
 	    server_loop(ClientList,StorePid);
-	{confirm, Client} -> 
-	    Client ! {abort, self()},
-	    server_loop(ClientList,StorePid);
+	{confirm, Client} ->
+	    Client ! {confirm, self()},
+	    server_loop(do_actions(Client,ClientList,StorePid),StorePid);
 	{action, Client, Act} ->
 	    io:format("Received~p from client~p.~n", [Act, Client]),
-	    case Act of ->
-               {read,Var} ->
-			   StorePid ! {read,Var};
-		   {write,Var,NewVal} ->
-			   StorePid ! {write,Var,NewVal};
-		   true ->
-			   io:format("Received strange action ~p from client~p.~n", [Act, Client])
-	    end,
-	    server_loop(ClientList,StorePid)
+	    server_loop(add_action(Client, Act, ClientList),StorePid)
     after 50000 ->
 	case all_gone(ClientList) of
 	    true -> exit(normal);    
@@ -65,15 +58,51 @@ server_loop(ClientList,StorePid) ->
 	end
     end.
 
+do_actions(Client,[],_) -> Client ! {abort, self()};
+do_actions(Client, [{Client, []}|T], _) -> [{Client, []}|T];
+do_actions(Client, [{Client, [AH|AT]}|T], StorePid) ->
+	case AH of
+		{read, Var} ->
+			StorePid ! {read, Var},
+			receive
+			{read_response, Val} ->
+				io:format("Client ~p read ~p", [Client, Val])
+			end;
+		{write, Var, Val} ->
+			StorePid ! {write, Var, Val},
+			receive
+			{write_response} ->
+				io:format("Client ~p wrote ~p", [Client, Val])
+			end;
+		true ->
+			io:format("Wrong in do_actions")
+	end,
+	do_actions(Client, [{Client, [AT]}|T], StorePid);
+do_actions(Client, [H|T], StorePid) -> [H|do_actions(Client, T, StorePid)].
+
+store_read(Var,[{Var,Val}|_]) ->
+	Val;
+store_read(Var,[_|T]) ->
+	store_read(Var,T).
+
+store_write(Var,Val,[{Var,_}|T], Client) ->
+	Client ! {write_response, Val},
+	[{Var,Val}|T];
+store_write(Var,Val,[H|T],Client) ->
+	[H|store_write(Var,Val,T,Client)].
+
 %% - The values are maintained here
 store_loop(ServerPid, Database) -> 
     receive
 	{print, ServerPid} -> 
 	    io:format("Database status:~n~p.~n",[Database]),
 	    store_loop(ServerPid,Database);
-	{read,Var} ->
-	    case Var of
-		     a -> 
+	{read, Var} ->
+		ServerPid ! {read_response,store_read(Var,Database)},
+		store_loop(ServerPid,Database);
+	{write, Var, Val} ->
+		store_loop(ServerPid,store_write(Var,Val,Database,ServerPid))
+				
     end.
 %%%%%%%%%%%%%%%%%%%%%%% ACTIVE SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
@@ -84,7 +113,7 @@ add_client(C,T) -> [C|T].
 
 add_action(_,_,[]) -> [];
 add_action(C, A, [{C,AL}|T]) -> [{C,AL ++ [A]}|T];
-add_action(C, A [H|T]) -> [H|add_action(C,A,T)].
+add_action(C, A, [H|T]) -> [H|add_action(C,A,T)].
 
 remove_client(_,[]) -> [];
 remove_client(C, [{C,_}|T]) -> T;
