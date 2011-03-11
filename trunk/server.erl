@@ -10,7 +10,6 @@
 
 -export([start/0]).
 
-
 %%%%%%%%%%%%%%%%%%%%%%% STARTING SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 start() -> 
     register(transaction_server, spawn(fun() ->
@@ -24,72 +23,49 @@ initialize() ->
     Initialvals = [{a,0},{b,0},{c,0},{d,0}], %% All variables are set to 0
     ServerPid = self(),
     StorePid = spawn_link(fun() -> store_loop(ServerPid,Initialvals) end),
-    server_loop([],StorePid).
+    server_loop([],[],StorePid).
 %%%%%%%%%%%%%%%%%%%%%%% STARTING SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 
 %%%%%%%%%%%%%%%%%%%%%%% ACTIVE SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% - The server maintains a list of all connected clients and a store holding
 %% the values of the global variable a, b, c and d 
-server_loop(ClientList,StorePid) ->
+server_loop(ClientList,LockList,StorePid) ->
     receive
 	{login, MM, Client} -> 
 	    MM ! {ok, self()},
 	    io:format("New client has joined the server:~p.~n", [Client]),
 	    StorePid ! {print, self()},
-	    server_loop(add_client({Client,[]},ClientList),StorePid);
+	    server_loop(add_client({Client,[]},ClientList),LockList,StorePid);
 	{close, Client} -> 
 	    io:format("Client~p has left the server.~n", [Client]),
 	    StorePid ! {print, self()},
-	    server_loop(remove_client(Client,ClientList),StorePid);
+	    server_loop(remove_client(Client,ClientList),LockList,StorePid);
 	{request, Client} -> 
 	    Client ! {proceed, self()},
-	    server_loop(ClientList,StorePid);
+	    server_loop(ClientList,LockList,StorePid);
 	{confirm, Client} ->
-	    Client ! {confirm, self()},
-	    server_loop(do_actions(Client,ClientList,StorePid),StorePid);
+		ClientWithActions = lists:keyfind(Client,1,ClientList)
+		case lockList(ClientWithActions,LockList) of
+			{false,NewLockList} ->
+				WaitList ++ [ClientWithActions],
+				server_loop(ClientList,NewLockList,StorePid);
+			{true,NewLockList} ->
+				spawn(server, do_actions(),[ClientWithActions,StorePid,self()]),
+				server_loop(lists:keyreplace(Client,1,ClientList,{Client,[]}),NewLockList,StorePid); 		
+	{committed, Client} ->
+		Client ! {committed, self()},
+		unlock(Client,LockList);
 	{action, Client, Act} ->
 	    io:format("Received~p from client~p.~n", [Act, Client]),
-	    server_loop(add_action(Client, Act, ClientList),StorePid)
+		io:format("~p~n", [ClientList]),
+	    server_loop(add_action(Client,Act,ClientList),LockList,StorePid)
     after 50000 ->
 	case all_gone(ClientList) of
 	    true -> exit(normal);    
-	    false -> server_loop(ClientList,StorePid)
+	    false -> server_loop(ClientList,LockList,StorePid)
 	end
     end.
-
-do_actions(Client,[],_) -> Client ! {abort, self()};
-do_actions(Client, [{Client, []}|T], _) -> [{Client, []}|T];
-do_actions(Client, [{Client, [AH|AT]}|T], StorePid) ->
-	case AH of
-		{read, Var} ->
-			StorePid ! {read, Var},
-			receive
-			{read_response, Val} ->
-				io:format("Client ~p read ~p", [Client, Val])
-			end;
-		{write, Var, Val} ->
-			StorePid ! {write, Var, Val},
-			receive
-			{write_response} ->
-				io:format("Client ~p wrote ~p", [Client, Val])
-			end;
-		true ->
-			io:format("Wrong in do_actions")
-	end,
-	do_actions(Client, [{Client, [AT]}|T], StorePid);
-do_actions(Client, [H|T], StorePid) -> [H|do_actions(Client, T, StorePid)].
-
-store_read(Var,[{Var,Val}|_]) ->
-	Val;
-store_read(Var,[_|T]) ->
-	store_read(Var,T).
-
-store_write(Var,Val,[{Var,_}|T], Client) ->
-	Client ! {write_response, Val},
-	[{Var,Val}|T];
-store_write(Var,Val,[H|T],Client) ->
-	[H|store_write(Var,Val,T,Client)].
 
 %% - The values are maintained here
 store_loop(ServerPid, Database) -> 
@@ -98,22 +74,90 @@ store_loop(ServerPid, Database) ->
 	    io:format("Database status:~n~p.~n",[Database]),
 	    store_loop(ServerPid,Database);
 	{read, Var} ->
-		ServerPid ! {read_response,store_read(Var,Database)},
-		store_loop(ServerPid,Database);
+	    io:format("Read action.~n"),
+	    ServerPid ! {read_response,do_read(Var, Database)},
+	    store_loop(ServerPid,Database);
 	{write, Var, Val} ->
-		store_loop(ServerPid,store_write(Var,Val,Database,ServerPid))
-				
+	    io:format("Write action.~n"),
+	    NewDatabase = do_write(Var, Val, Database),
+	    ServerPid ! {write_confirm, self()},
+	    store_loop(ServerPid,NewDatabase);
+	X ->
+	    io:format("Database received unknown operator.~p~n", [X]),
+	    store_loop(ServerPid,Database)
     end.
 %%%%%%%%%%%%%%%%%%%%%%% ACTIVE SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-
-
 
 %% - Low level function to handle lists
 add_client(C,T) -> [C|T].
 
 add_action(_,_,[]) -> [];
-add_action(C, A, [{C,AL}|T]) -> [{C,AL ++ [A]}|T];
-add_action(C, A, [H|T]) -> [H|add_action(C,A,T)].
+add_action(C,A,[{C,AL}|T]) -> [{C,AL ++ [A]}|T];
+add_action(C,A,[H|T]) -> [H|add_action(C,A,T)].
+
+lockList({Client,[]},LockList) -> LockList;
+lockList({Client,[H|T]},LockList) ->
+	case lock({Client,element(2,H)},LockList) of
+		true ->
+			lockList({Client,T},LockList);
+		false ->
+			lockList({Client,T},LockList),
+			false;
+		X ->
+			lockList({Client,T},X)
+	end.
+
+lock(Var,LockList) ->
+	case lists:keyfind(Var,2,LockList) of
+	false ->
+		[Var|LockList];
+	Var ->
+		true;
+	_ ->
+		false
+	end.
+
+unlock(Client,LockList) ->
+	lists:filter(
+		(fun({X,_}) -> 
+			case X of
+				Client ->
+					false;
+				_ ->
+					true
+			end
+		end),LockList).
+
+do_actions({Client,[]},_,ServerPid) -> 
+    ServerPid ! {committed, Client};
+do_actions({Client,[H|T]},StorePid,ServerPid) ->
+    case H of
+	{read,Var} ->
+	    StorePid ! {read,Var},
+	    receive
+		{read_response,Answer} ->
+		    io:format("Read response: ~p~n", [Answer])
+	    end;
+	{write,Var,Val} ->
+	    StorePid ! {write,Var,Val};
+	X ->
+	    io:format("Wrong in do_actions! ~p~n",[X])
+    end
+	do_actions({Client,T},StorePid,ServerPid).
+
+do_read(_,[]) ->
+    io:format("Wrong in do_read!");
+do_read(Var,[{Var,Val}|_]) ->
+    Val;
+do_read(Var,[_|T]) ->
+    do_read(Var,T).
+
+do_write(_,_,[]) ->
+    io:format("Wrong in do_write!");
+do_write(Var,NewVal,[{Var,_}|T]) ->
+    [{Var,NewVal}|T];
+do_write(Var,NewVal,[H|T]) ->
+    [H|do_write(Var,NewVal,T)].
 
 remove_client(_,[]) -> [];
 remove_client(C, [{C,_}|T]) -> T;
