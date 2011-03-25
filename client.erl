@@ -5,6 +5,7 @@
 %%      2/ It creates a window and sets up the prompt and the title.
 %%      4/ It waits for connection message (see disconnected).
 %%
+%% Modified by Martin Doversten, Thomas Nordström VT2011
 
 -module(client).
 
@@ -77,6 +78,7 @@ connected(Window, ServerPid) ->
     end.
 
 %% - Asking to process a request
+%% - Updated send() with new arguments, needed for packet loss support
 process(Window, ServerPid, Transaction) ->
     ServerPid ! {request, self()}, %% Send a request to server and wait for proceed message
     receive
@@ -87,6 +89,9 @@ process(Window, ServerPid, Transaction) ->
     end.
 
 %% - Sending the transaction and waiting for confirmation
+%% - Added packet loss support
+%% - Saves an unmodified version of the transaction until all packages has been successfully transmitted
+%% - Keeps track of packet number in the transaction
 send(Window, ServerPid, [],Transaction, PacketN) ->
     ServerPid ! {confirm, self(), PacketN}, %% Once all the list (transaction) items sent, send confirmation
     receive

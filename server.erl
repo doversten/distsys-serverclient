@@ -5,6 +5,14 @@
 %%      1/ It makes the current process as a system process in order to trap exit.
 %%      2/ It creates a process evaluating the store_loop() function.
 %%      4/ It executes the server_loop() function.
+%%
+%% Modified by Martin Doversten, Thomas Nordström VT2011
+%% Server uses a type of two phase commit to ensure Actomicity, Isolation, Concurrency for all transactions.
+%% We ensure this by using a locking list which keeps track of all currently used (reading, writing) variables in the database.
+%% When the server tries to excute a new transaction all variables needs to not be in the lock list.
+%% If any variable is locked of a transaction, that transaction in enqueued to the waiting list and any unlocked varible will be locked by that transaction. This is to avoid starvation and deadlocks.
+%% The server will only excute the transaction if all operations is recieved from the client.
+%% If packet loss occurs the server requests a resend from the client and saves the recvied packages.
 
 -module(server).
 
@@ -30,6 +38,7 @@ initialize() ->
 %%%%%%%%%%%%%%%%%%%%%%% ACTIVE SERVER %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% - The server maintains a list of all connected clients and a store holding
 %% the values of the global variable a, b, c and d 
+%% Modified arguments to the server loop and updated all calls
 server_loop(ClientList,LockList,WaitList,StorePid) ->
     receive
 	{login, MM, Client} -> 
@@ -44,6 +53,8 @@ server_loop(ClientList,LockList,WaitList,StorePid) ->
 	{request, Client} -> 
 	    Client ! {proceed, self()},
 	    server_loop(ClientList,LockList,WaitList,StorePid);
+	%% Tries to commit, if the transaction is locked add it to the wainting list
+	%% Transactions will only be executed if all operations for the given transaction have been recieved
 	{confirm, Client, PacketN} ->
 		ClientWithActions = our_key_find(Client,1,ClientList),
 		case PacketN - length(element(2,ClientWithActions)) of
@@ -60,6 +71,7 @@ server_loop(ClientList,LockList,WaitList,StorePid) ->
 				Client ! {packetloss, self()},
 				server_loop(ClientList,LockList,WaitList,StorePid)
 		end;
+	%% Unlocks variable used by the previously commited transaction and sends a "committed" message to the cliet
 	{committed, Client} ->
 		Client ! {committed, self()},
 		NewLockList = unlock(Client,LockList),
@@ -76,6 +88,7 @@ server_loop(ClientList,LockList,WaitList,StorePid) ->
     end.
 
 %% - The values are maintained here
+%% Added functionality to store and retrive information from the database
 store_loop(ServerPid, Database) -> 
     receive
 	{print, ServerPid} -> 
@@ -99,12 +112,14 @@ store_loop(ServerPid, Database) ->
 %% - Low level function to handle lists
 add_client(C,T) -> [C|T].
 
+%% Add an action to the current client's action list 
 add_action(_,_,[],_) -> [];
 add_action(C,A,[{C,AL}|T],PacketN) ->
 		[{C,add_action_to_client(AL, A, PacketN, 1)}|T];
 add_action(C,A,[H|T],PacketN) ->
 	[H|add_action(C,A,T,PacketN)].
 
+%% Given a client's action list, inserts the action in the right executing order based on the packet number from the client
 add_action_to_client([], Action, PacketN, PacketN) -> [{Action,PacketN}];
 add_action_to_client([], Action,PacketN,_) -> [{Action,PacketN}];
 add_action_to_client([{Action,PacketN}|T], Action, PacketN, PacketN) -> [{Action,PacketN}|T];
@@ -118,7 +133,7 @@ add_action_to_client([{Action,PacketN}|T], NewAction, NewPacketN, Counter) ->
 			[{Action,PacketN}|add_action_to_client(T,NewAction,NewPacketN,Counter+1)]
 	end.
 	
-
+%% Locks all unlocked variables for a given transaction and returns true if the transaction is not blocked
 lockList({_,[]},LockList) -> {true, LockList};
 lockList({Client,[H|T]},LockList) ->
 	case lock({Client,element(2,H)},LockList) of
@@ -130,6 +145,7 @@ lockList({Client,[H|T]},LockList) ->
 			lockList({Client,T},X)
 	end.
 
+%% For some reason lists:keyfind didn't work so we implemented our own
 our_key_find(_,_,[]) -> false;
 our_key_find(Key,N,[H|T]) ->
 	case element(N,H) of
@@ -139,6 +155,7 @@ our_key_find(Key,N,[H|T]) ->
 			our_key_find(Key,N,T)
 	end.
 
+%% Tries to lock a variable in the database and returns the new lock list if the variable were successfully locked, true if the varibale already locked by "its" client, false otherwise
 lock(Var,LockList) ->
 	case our_key_find(element(2,Var),2,LockList) of
 	false ->
@@ -149,6 +166,7 @@ lock(Var,LockList) ->
 		false
 	end.
 
+%% Unlockes all variables for a given client, return the new lock list
 unlock(Client,LockList) ->
 	lists:filter(
 		(fun({X,_}) -> 
@@ -160,6 +178,7 @@ unlock(Client,LockList) ->
 			end
 		end),LockList).
 
+%% Goes through the waiting list and tries to execute all the waiting transactions
 excute_waiting_list([],_,_) -> [];
 excute_waiting_list([H|T],LockList,StorePid) ->
 	case lockList(H,LockList) of
@@ -170,6 +189,7 @@ excute_waiting_list([H|T],LockList,StorePid) ->
 			excute_waiting_list(T,NewLockList,StorePid)
 	end.
 
+%% Runs as a seperate thread which executes all operations of a given transaction and tells the server when finnished
 do_actions({Client,[]},_,ServerPid) ->
     ServerPid ! {committed, Client};
 do_actions({Client,[{H,PacketN}|T]},StorePid,ServerPid) ->
@@ -192,6 +212,7 @@ do_actions({Client,[{H,PacketN}|T]},StorePid,ServerPid) ->
     end,
 	do_actions({Client,T},StorePid,ServerPid).
 
+%% Store function to read a variable from the database
 do_read(_,[]) ->
     io:format("Wrong in do_read!");
 do_read(Var,[{Var,Val}|_]) ->
@@ -199,6 +220,7 @@ do_read(Var,[{Var,Val}|_]) ->
 do_read(Var,[_|T]) ->
     do_read(Var,T).
 
+%% Store function to write to a variable in the database
 do_write(_,_,[]) ->
     io:format("Wrong in do_write!");
 do_write(Var,NewVal,[{Var,_}|T]) ->
