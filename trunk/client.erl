@@ -87,8 +87,8 @@ process(Window, ServerPid, Transaction) ->
     end.
 
 %% - Sending the transaction and waiting for confirmation
-send(Window, ServerPid, [],Transaction, _) ->
-    ServerPid ! {confirm, self()}, %% Once all the list (transaction) items sent, send confirmation
+send(Window, ServerPid, [],Transaction, PacketN) ->
+    ServerPid ! {confirm, self(), PacketN}, %% Once all the list (transaction) items sent, send confirmation
     receive
 	{abort, ServerPid} -> insert_str(Window, "Aborted... type run if you want to try again!\n"),
 		       connected(Window, ServerPid);
