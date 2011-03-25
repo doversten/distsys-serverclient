@@ -44,16 +44,22 @@ server_loop(ClientList,LockList,WaitList,StorePid) ->
 	{request, Client} -> 
 	    Client ! {proceed, self()},
 	    server_loop(ClientList,LockList,WaitList,StorePid);
-	{confirm, Client} ->
+	{confirm, Client, PacketN} ->
 		ClientWithActions = our_key_find(Client,1,ClientList),
-		case lockList(ClientWithActions,LockList) of
-			{false,NewLockList} ->
-				server_loop(ClientList,NewLockList,WaitList ++ [ClientWithActions],StorePid);
-			{true,NewLockList} ->
-				Sp = self(),
-				spawn(fun() -> do_actions(ClientWithActions,StorePid,Sp) end),
-				server_loop(lists:keyreplace(Client,1,ClientList,{Client,[]}),NewLockList,WaitList,StorePid)
-		end;		
+		case PacketN - length(element(2,ClientWithActions)) of
+			1 ->
+				case lockList(ClientWithActions,LockList) of
+					{false,NewLockList} ->
+						server_loop(ClientList,NewLockList,WaitList ++ [ClientWithActions],StorePid);
+					{true,NewLockList} ->
+						Sp = self(),
+						spawn(fun() -> do_actions(ClientWithActions,StorePid,Sp) end),
+						server_loop(lists:keyreplace(Client,1,ClientList,{Client,[]}),NewLockList,WaitList,StorePid)
+				end;
+			_ ->
+				Client ! {packetloss, self()},
+				server_loop(ClientList,LockList,WaitList,StorePid)
+		end;
 	{committed, Client} ->
 		Client ! {committed, self()},
 		NewLockList = unlock(Client,LockList),
@@ -61,13 +67,7 @@ server_loop(ClientList,LockList,WaitList,StorePid) ->
 	{action, Client, Act, PacketN} ->
 	    io:format("Received~p from client~p.~n", [Act, Client]),
 		io:format("~p~n", [ClientList]),
-		case add_action(Client,Act,ClientList,PacketN) of
-			{false, NewClientList} ->
-				Client ! {packetloss, self()},
-				server_loop(NewClientList,LockList,WaitList,StorePid);
-			{true, NewClientList} ->
-	    		server_loop(NewClientList,LockList,WaitList,StorePid)
-		end
+		server_loop(add_action(Client,Act,ClientList,PacketN),LockList,WaitList,StorePid)
     after 50000 ->
 		case all_gone(ClientList) of
 	    	true -> exit(normal);   
@@ -82,11 +82,11 @@ store_loop(ServerPid, Database) ->
 	    io:format("Database status:~n~p.~n",[Database]),
 	    store_loop(ServerPid,Database);
 	{read, Var, ActionPid} ->
-	    io:format("Read action.~n"),
+	    io:format("Reading...~n"),
 	    ActionPid ! {read_response,do_read(Var, Database)},
 	    store_loop(ServerPid,Database);
 	{write, Var, Val, ActionPid} ->
-	    io:format("Write action.~n"),
+	    io:format("Writing...~n"),
 	    NewDatabase = do_write(Var, Val, Database),
 	    ActionPid ! {write_confirm, self()},
 	    store_loop(ServerPid,NewDatabase);
@@ -99,43 +99,23 @@ store_loop(ServerPid, Database) ->
 %% - Low level function to handle lists
 add_client(C,T) -> [C|T].
 
-%%add_action(_,_,[],_) -> {false,[]};
-%%add_action(C,A,[{C,AL}|T],PacketN) ->
-%%	NewList = AL ++ [A],
-%%	case length(NewList) of
-%%		PacketN ->
-%%			{true,[{C,NewList}|T]};
-%%		_ ->
-%%			{false,[{C,[]}|T]}
-%%	end;
-%%add_action(C,A,[H|T],PacketN) -> 
-%%	NewAddAction = add_action(C,A,T,PacketN),
-%%	setelement(2,NewAddAction,[H|element(2,NewAddAction)]).
-
-add_action(_,_,[],_) -> {false,[]};
+add_action(_,_,[],_) -> [];
 add_action(C,A,[{C,AL}|T],PacketN) ->
-	case add_action_to_client(AL, A, PacketN, 1) of
-		{true, NewList} ->
-			{true, [{C,NewList}|T]};
-		{false, NewList} ->
-			{false, [{C,NewList}|T]}
-	end;
-add_action(C,A,[H|T],PacketN) -> 
-	NewAddAction = add_action(C,A,T,PacketN),
-	setelement(2,NewAddAction,[H|element(2,NewAddAction)]).
+		[{C,add_action_to_client(AL, A, PacketN, 1)}|T];
+add_action(C,A,[H|T],PacketN) ->
+	[H|add_action(C,A,T,PacketN)].
 
-add_action_to_client([], Action, PacketN, PacketN) -> {true, [{Action,PacketN}]};
-add_action_to_client([], Action,PacketN,_) -> {false, [{Action,PacketN}]};
-add_action_to_client([{Action,PacketN}|T], Action, PacketN, PacketN) -> {true, [{Action,PacketN}|T]};
-add_action_to_client([{Action,PacketN}|T], Action, PacketN, _) -> {false, [{Action,PacketN}|T]};
-add_action_to_client(AL,Action,PacketN,PacketN) -> {true, [{Action,PacketN}|AL]};
+add_action_to_client([], Action, PacketN, PacketN) -> [{Action,PacketN}];
+add_action_to_client([], Action,PacketN,_) -> [{Action,PacketN}];
+add_action_to_client([{Action,PacketN}|T], Action, PacketN, PacketN) -> [{Action,PacketN}|T];
+add_action_to_client([{Action,PacketN}|T], Action, PacketN, _) -> [{Action,PacketN}|T];
+add_action_to_client(AL,Action,PacketN,PacketN) -> [{Action,PacketN}|AL];
 add_action_to_client([{Action,PacketN}|T], NewAction, NewPacketN, Counter) ->
 	case PacketN > NewPacketN of
 		true ->
-			{false, [{NewAction,NewPacketN}|[{Action,PacketN}|T]]};
+			[{NewAction,NewPacketN}|[{Action,PacketN}|T]];
 		false ->
-			NewActionList = add_action_to_client(T,NewAction,NewPacketN,Counter+1),
-			setelement(2,NewActionList,[{Action,PacketN}|element(2,NewActionList)])
+			[{Action,PacketN}|add_action_to_client(T,NewAction,NewPacketN,Counter+1)]
 	end.
 	
 
@@ -192,7 +172,8 @@ excute_waiting_list([H|T],LockList,StorePid) ->
 
 do_actions({Client,[]},_,ServerPid) ->
     ServerPid ! {committed, Client};
-do_actions({Client,[{H,_}|T]},StorePid,ServerPid) ->
+do_actions({Client,[{H,PacketN}|T]},StorePid,ServerPid) ->
+	io:format("Executes action ~p, with packet number ~p~n",[H,PacketN]),
     case H of
 	{read,Var} ->
 	    StorePid ! {read,Var,self()},
